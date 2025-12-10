@@ -1,0 +1,41 @@
+#pragma kernel update_ranges
+#pragma kernel reset_ranges
+
+RWStructuredBuffer<uint> cell_ids;
+RWStructuredBuffer<int> cell_starts;
+RWStructuredBuffer<int> cell_ends;
+
+cbuffer Uniforms : register(b0)
+{
+    uint boid_count;
+    uint total_cells;
+}
+
+[numthreads(256,1,1)]
+void reset_ranges(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= total_cells) return;
+
+    cell_starts[i] = -1;
+    cell_ends[i] = -1;
+}
+
+[numthreads(256,1,1)]
+void update_ranges(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+
+    if (i >= boid_count) return;
+
+    uint cell = cell_ids[i];
+
+    if (i == 0 || cell_ids[i - 1] != cell)
+    {
+        cell_starts[cell] = i;
+    }
+    if (i == boid_count - 1 || cell_ids[i + 1] != cell)
+    {
+        cell_ends[cell] = i;
+    }
+}

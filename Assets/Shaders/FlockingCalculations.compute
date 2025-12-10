@@ -1,0 +1,249 @@
+﻿#pragma kernel flock
+#pragma use_dxc
+
+#include "SpatialHashHelper.hlsl"
+#include "Assets/Shaders/Common.hlsl"
+
+StructuredBuffer<float3> positions;
+StructuredBuffer<float3> velocities;
+StructuredBuffer<uint> cell_ids;
+StructuredBuffer<uint> boid_ids;
+StructuredBuffer<int> cell_starts;
+StructuredBuffer<int> cell_ends;
+
+RWStructuredBuffer<float3> accelerations;
+
+cbuffer Parameters : register(b0)
+{
+    int boid_count;
+    float neighbour_distance;
+    float cell_size;
+    float max_speed;
+    float cos_half_fov;
+    float separation_weight;
+    float cohesion_weight;
+    float alignment_weight;
+    float separation_radius;
+    float grid_resolution;
+    float min_bound;
+    float max_bound;
+    float avoidance_weight;
+    float avoidance_radius;
+}
+
+bool is_neighbour(uint boid_id, uint other_id, float cos_half_fov, float3 forward)
+{
+    float3 diff = positions[other_id] - positions[boid_id];
+    float sqr_dist = dot(diff, diff);
+
+    float inv_distance = rsqrt(sqr_dist + 1e-12f);
+    float cos_angle = dot(forward, diff * inv_distance);
+
+    return boid_id != other_id &
+        sqr_dist <= neighbour_distance * neighbour_distance &
+        cos_angle >= cos_half_fov;
+}
+
+float3 sum_acceleration(float3 aln, float3 coh, float3 sep, float3 vel, float3 pos, uint n)
+{
+    float has = n > 0 ? 1.0f : 0.0f;
+    float inv = has / max((float)n, 1.0f);
+
+    aln *= inv;
+    coh *= inv;
+    sep *= inv;
+
+    aln = safe_normalize(aln) * max_speed - vel;
+    coh = safe_normalize(coh - pos) * max_speed - vel;
+
+    return (aln * alignment_weight +
+        coh * cohesion_weight +
+        sep * separation_weight) * has;
+}
+//
+// float3 SmoothWallNormal(float3 pos)
+// {
+//     float3 box_min = float3(min_bound, min_bound, min_bound);
+//     float3 boxMax = float3(max_bound, max_bound, max_bound);
+//     float3 toMin = pos - box_min;
+//     float3 toMax = boxMax - pos;
+//
+//     float3 d = float3(
+//         min(toMin.x, toMax.x),
+//         min(toMin.y, toMax.y),
+//         min(toMin.z, toMax.z)
+//     );
+//
+//     float wx = 1.0 / (d.x + 1e-6);
+//     float wy = 1.0 / (d.y + 1e-6);
+//     float wz = 1.0 / (d.z + 1e-6);
+//
+//     float3 nx = (toMin.x < toMax.x) ? float3(1, 0, 0) : float3(-1, 0, 0);
+//     float3 ny = (toMin.y < toMax.y) ? float3(0, 1, 0) : float3(0, -1, 0);
+//     float3 nz = (toMin.z < toMax.z) ? float3(0, 0, 1) : float3(0, 0, -1);
+//
+//     float3 n = wx * nx + wy * ny + wz * nz;
+//     return normalize(n);
+// }
+//
+// float3 WallAvoidanceBuffered(float3 pos, float3 vel)
+// {
+//     float3 bounds_min = float3(min_bound, min_bound, min_bound);
+//     float3 bounds_max = float3(max_bound, max_bound, max_bound);
+//
+//     float3 to_min = pos - bounds_min;
+//     float3 to_max = bounds_max - pos;
+//
+//     // Calculate distances to each wall
+//     float3 dist_to_walls = float3(
+//         min(to_min.x, to_max.x),
+//         min(to_min.y, to_max.y),
+//         min(to_min.z, to_max.z)
+//     );
+//
+//     // Directions away from walls
+//     float3 dir_x = (to_min.x < to_max.x) ? float3(1, 0, 0) : float3(-1, 0, 0);
+//     float3 dir_y = (to_min.y < to_max.y) ? float3(0, 1, 0) : float3(0, -1, 0);
+//     float3 dir_z = (to_min.z < to_max.z) ? float3(0, 0, 1) : float3(0, 0, -1);
+//
+//     float3 repulse_force = 0;
+//     float damping_factor = 0.1f; // Small damping to reduce velocity toward walls
+//
+//     // For each axis, apply force if within avoidance_radius
+//     if (dist_to_walls.x < avoidance_radius)
+//     {
+//         float strength = avoidance_weight / (dist_to_walls.x + 1e-6f); // Inverse distance scaling
+//         repulse_force += dir_x * strength;
+//         repulse_force -= vel * damping_factor; // Damping component
+//     }
+//     if (dist_to_walls.y < avoidance_radius)
+//     {
+//         float strength = avoidance_weight / (dist_to_walls.y + 1e-6f);
+//         repulse_force += dir_y * strength;
+//         repulse_force -= vel * damping_factor;
+//     }
+//     if (dist_to_walls.z < avoidance_radius)
+//     {
+//         float strength = avoidance_weight / (dist_to_walls.z + 1e-6f);
+//         repulse_force += dir_z * strength;
+//         repulse_force -= vel * damping_factor;
+//     }
+//
+//     // Tangent force for sliding (reduced weight for subtlety)
+//     float3 n = SmoothWallNormal(pos);
+//     float3 tangent = normalize(vel - dot(vel, n) * n);
+//     float3 tangent_force = tangent * (avoidance_weight * 0.05f); // Reduced from 0.15f for balance
+//
+//     return repulse_force + tangent_force;
+// }
+
+static const float3 wall_normals[6] = {
+    float3(0.0f,1.0f,0.0f), //podłoga
+    float3( 0.0f,  0.0f, -1.0f), // 1: ściana +Z (z = max) -> normal do wnętrza (-Z)
+    float3( 0.0f,  0.0f,  1.0f), // 2: ściana -Z (z = min) -> normal do wnętrza (+Z)
+    float3(-1.0f,  0.0f,  0.0f), // 3: ściana +X (x = max) -> normal do wnętrza (-X)
+    float3( 1.0f,  0.0f,  0.0f), // 4: ściana -X (x = min) -> normal do wnętrza (+X)
+    float3(0.0f,-1.0f,0.0f) //sufit
+};
+float3 wall_avoidance (float3 pos, float3 vel, float3 forward)
+{
+    float3 tangent = 0;
+    float dist_to_wall[6] = {
+        pos.y - min_bound,
+        max_bound - pos.z,
+        pos.z - min_bound,
+        max_bound - pos.x,
+        pos.x - min_bound,
+        max_bound - pos.y
+    };
+    
+    [unroll]
+    for (int i = 0; i < 6; i++)
+    {
+        float3 normal = wall_normals[i];
+        float vel_dot = dot(forward, normal);
+        float3 perpendicular_comp = normal - vel_dot * forward;
+        uint approach_mask = vel_dot < 0 ? 1 : 0;
+
+        float d = max(dist_to_wall[i], 0.01);
+        float strength = avoidance_radius / (d * d);
+        
+        tangent += safe_normalize(perpendicular_comp) * strength * approach_mask;
+    }
+    return tangent * avoidance_weight;
+}
+
+static const int3 offset_lut[27] = {
+    int3(-1, -1, -1), int3(0, -1, -1), int3(1, -1, -1),
+    int3(-1, 0, -1), int3(0, 0, -1), int3(1, 0, -1),
+    int3(-1, 1, -1), int3(0, 1, -1), int3(1, 1, -1),
+
+    int3(-1, -1, 0), int3(0, -1, 0), int3(1, -1, 0),
+    int3(-1, 0, 0), int3(0, 0, 0), int3(1, 0, 0),
+    int3(-1, 1, 0), int3(0, 1, 0), int3(1, 1, 0),
+
+    int3(-1, -1, 1), int3(0, -1, 1), int3(1, -1, 1),
+    int3(-1, 0, 1), int3(0, 0, 1), int3(1, 0, 1),
+    int3(-1, 1, 1), int3(0, 1, 1), int3(1, 1, 1)
+};
+
+[numthreads(256,1,1)]
+void flock(uint id : SV_DispatchThreadID)
+{
+    if (id.x >= boid_count) return;
+
+    float3 alignment = 0;
+    float3 cohesion = 0;
+    float3 separation = 0;
+    uint neighbour_count = 0;
+
+    // uint boid_id = id.x;
+    uint boid_id = boid_ids[id.x];
+
+    float3 position = positions[boid_id];
+    float3 velocity = velocities[boid_id];
+    float3 forward = safe_normalize(velocity);
+
+    float3 rel = float3(position.x - min_bound, position.y - min_bound, position.z - min_bound);
+    int3 cell = (int3)floor(rel / cell_size);
+
+    for (uint i = 0; i < 27; i++)
+    {
+        int other_cell = get_hash_index_by_cell(cell + offset_lut[i], grid_resolution, cell_size);
+
+        int cell_start = other_cell >= 0 ? cell_starts[other_cell] : -1;
+        int cell_end = other_cell >= 0 ? cell_ends[other_cell] : -1;
+
+        int valid = cell_start >= 0 && cell_end >= 0;
+
+        [branch]
+        if (valid)
+        {
+            for (int j = cell_start; j <= cell_end; j++)
+            {
+                uint other_id = boid_ids[j];
+                uint mask = is_neighbour(boid_id, other_id, cos_half_fov, forward) ? 1u : 0u;
+
+                alignment += velocities[other_id] * mask;
+                cohesion += positions[other_id] * mask;
+
+                float3 diff = position - positions[other_id];
+                float sqr_dist = dot(diff, diff);
+
+                separation += diff * (separation_radius / (sqr_dist + 1e-12f)) * mask;
+                neighbour_count += mask;
+            }
+        }
+    }
+    accelerations[boid_id] = sum_acceleration(
+        alignment,
+        cohesion,
+        separation,
+        velocities[boid_id],
+        position,
+        neighbour_count
+    );
+    accelerations[boid_id] += wall_avoidance(position,velocity, forward);
+    // accelerations[boid_id] += WallAvoidanceBuffered(position,velocity);
+    
+}

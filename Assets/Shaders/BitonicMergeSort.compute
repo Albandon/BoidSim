@@ -1,0 +1,170 @@
+#pragma kernel sort
+
+#define E_LOCAL_BITONIC_MERGE_SORT_EXAMPLE   0
+#define E_LOCAL_DISPERSE                     1
+#define E_BIG_FLIP                           2
+#define E_BIG_DISPERSE                       3
+
+RWStructuredBuffer<uint> values;
+RWStructuredBuffer<uint> keys;
+
+cbuffer Parameters : register(b0) {
+    uint h;
+    uint algorithm;
+    uint count; // <-- now provided from C#
+}
+
+groupshared uint local_values[1024];
+groupshared uint local_keys[1024];
+
+bool is_bigger (uint a, uint b) {
+    return a > b;
+}
+
+void swap(inout uint key_a, inout uint val_a, inout uint key_b, inout uint  val_b)
+{
+    if (is_bigger(key_a, key_b))
+    {
+        uint tmp_k = key_a;
+        uint tmp_v = val_a;
+        key_a = key_b;
+        val_a = val_b;
+        key_b = tmp_k;
+        val_b = tmp_v;
+    }
+}
+
+void global_compare_and_swap (uint2 index) {
+    // guard against OOB
+    if (index.x >= count || index.y >= count) return;
+    swap(keys[index.x], values[index.x],
+         keys[index.y], values[index.y]);
+}
+
+void local_compare_and_swap (uint2 index) {
+    // index into local arrays always valid (we size them to localCapacity)
+    swap(local_keys[index.x], local_values[index.x],
+         local_keys[index.y], local_values[index.y]);
+}
+
+void big_flip (uint h_val, uint thread_id) {
+    uint t_prime = thread_id;
+    uint half_h = h_val >> 1;
+
+    if (half_h == 0) return;
+
+    uint q = ((2 * t_prime) / h_val) * h_val;
+    uint x = q + (t_prime % half_h);
+    uint y = q + h_val - (t_prime % half_h) - 1;
+
+    global_compare_and_swap(uint2(x, y));
+}
+
+void big_disperse (uint h_val, uint thread_id){
+    uint t_prime = thread_id;
+    uint half_h = h_val >> 1;
+
+    if (half_h == 0) return;
+
+    uint q = ((2 * t_prime) / h_val) * h_val;
+    uint x = q + (t_prime % half_h);
+    uint y = q + (t_prime % half_h) + half_h;
+
+    global_compare_and_swap(uint2(x, y));
+}
+
+void local_flip (uint h_val, uint group_thread_id) {
+    uint t = group_thread_id;
+    GroupMemoryBarrierWithGroupSync();
+
+    uint half_h = h_val >> 1;
+    if (half_h == 0) return;
+
+    uint base_index = h_val * ((2 * t) / h_val);
+    uint2 indices = uint2(base_index + (t % half_h),
+                          base_index + h_val - 1 - (t % half_h));
+
+    local_compare_and_swap(indices);
+}
+
+void local_disperse (uint h_val, uint group_thread_id){
+    uint t = group_thread_id;
+    for (; h_val > 1 ; h_val >>= 1) {
+        GroupMemoryBarrierWithGroupSync();
+
+        uint half_h = h_val >> 1;
+        if (half_h == 0) break;
+
+        uint base_index = h_val * ((2 * t) / h_val);
+        uint2 indices = uint2(base_index + (t % half_h),
+                              base_index + half_h + (t % half_h));
+        
+        local_compare_and_swap(indices);
+    } 
+}
+
+void local_bms(uint h_val, uint group_thread_id) {
+    uint t = group_thread_id;
+    for (uint hh = 2; hh <= h_val; hh <<= 1) {
+        local_flip(hh, t);
+        local_disperse(hh >> 1, t);
+    }
+}
+
+[numthreads(512,1,1)]
+void sort(uint3 group_id : SV_GroupID,
+          uint3 group_thread_id : SV_GroupThreadID,
+          uint3 dispatch_thread_id : SV_DispatchThreadID)
+{
+    uint t = group_thread_id.x;
+    uint group_size = 512;
+    uint offset = group_size * 2 * group_id.x;
+
+    // --- LOAD INTO LOCAL (with bounds checks) ---
+    if (algorithm <= E_LOCAL_DISPERSE)
+    {
+        uint idx0 = offset + t * 2;
+        uint idx1 = offset + t * 2 + 1;
+
+        // if out of bounds, fill with sentinel (max) so it will sink to the end
+        local_keys[t * 2]     = (idx0 < count) ? keys[idx0] : 0xFFFFFFFFu;
+        local_keys[t * 2 + 1] = (idx1 < count) ? keys[idx1] : 0xFFFFFFFFu;
+
+        local_values[t * 2]     = (idx0 < count) ? values[idx0] : 0u;
+        local_values[t * 2 + 1] = (idx1 < count) ? values[idx1] : 0u;
+    }
+
+    switch (algorithm) {
+        case E_LOCAL_BITONIC_MERGE_SORT_EXAMPLE:
+            local_bms(h, t);
+            break;
+        case E_LOCAL_DISPERSE:
+            local_disperse(h, t);
+            break;
+        case E_BIG_FLIP:
+            big_flip(h, dispatch_thread_id.x);
+            break;
+        case E_BIG_DISPERSE:
+            big_disperse(h, dispatch_thread_id.x);
+            break;
+        default:
+            break;
+    }
+
+    // --- WRITE BACK (only valid indices) ---
+    if (algorithm <= E_LOCAL_DISPERSE) {
+        GroupMemoryBarrierWithGroupSync();
+
+        uint outIdx0 = offset + t * 2;
+        uint outIdx1 = offset + t * 2 + 1;
+
+        if (outIdx0 < count) {
+            keys[outIdx0] = local_keys[t * 2];
+            values[outIdx0] = local_values[t * 2];
+        }
+        if (outIdx1 < count) {
+            keys[outIdx1] = local_keys[t * 2 + 1];
+            values[outIdx1] = local_values[t * 2 + 1];
+        }
+    }
+}

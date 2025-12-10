@@ -1,0 +1,40 @@
+#pragma kernel update
+
+#include "SpatialHashHelper.hlsl"
+#include "Common.hlsl"
+
+StructuredBuffer<float3> accelerations;
+StructuredBuffer<uint> boid_ids;
+
+RWStructuredBuffer<float3> positions;
+RWStructuredBuffer<float3> velocities;
+RWStructuredBuffer<uint> cell_ids;
+
+cbuffer Parameters : register(b1) {
+    uint boid_count;
+    float delta_time;
+    float max_speed;
+    float grid_resolution;
+    float cell_size;
+    float min_bound;
+    float max_bound;
+}
+
+[numthreads(256,1,1)]
+void update (uint3 id : SV_DispatchThreadID) {
+    if (id.x >= boid_count) return;
+
+    uint boid_id = boid_ids[id.x];
+    // uint boid_id = id.x;
+    
+    velocities[boid_id] += accelerations[boid_id] * delta_time;
+    velocities[boid_id] = clamp_length(velocities[boid_id], max_speed);
+    positions[boid_id] += velocities[boid_id] * delta_time;
+
+    cell_ids[id.x] = get_hash_index(positions[boid_id],
+        grid_resolution,
+        cell_size,
+        min_bound,
+        max_bound
+    );
+}
